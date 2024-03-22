@@ -1,10 +1,12 @@
-// Copyright (C) 2018-2023 - DevSH Graphics Programming Sp. z O.O.
+// Copyright (C) 2018-2024 - DevSH Graphics Programming Sp. z O.O.
 // This file is part of the "Nabla Engine".
 // For conditions of distribution and use, see copyright notice in nabla.h
 
 
 // I've moved out a tiny part of this example into a shared header for reuse, please open and read it.
-#include "../common/MonoSystemMonoLoggerApplication.hpp"
+#include "../common/MonoDeviceApplication.hpp"
+#include "../common/MonoAssetManagerAndBuiltinResourceApplication.hpp"
+
 
 #include "app_resources/common.hlsl"
 
@@ -17,292 +19,136 @@ using namespace video;
 const uint32_t elementCount = 10000;
 
 // this time instead of defining our own `int main()` we derive from `nbl::system::IApplicationFramework` to play "nice" wil all platforms
-class HelloComputeApp final : public nbl::examples::MonoSystemMonoLoggerApplication
+class BubbleSortApp final : public examples::MonoDeviceApplication, public examples::MonoAssetManagerAndBuiltinResourceApplication
 {
-	using base_t = examples::MonoSystemMonoLoggerApplication;
+	using device_base_t = examples::MonoDeviceApplication;
+	using asset_base_t = examples::MonoAssetManagerAndBuiltinResourceApplication;
+
+	//We store a Compute Pipeline describing the tasks of the compute shader that does the BubbleSort work
+	smart_refctd_ptr<IGPUComputePipeline> m_pipeline;
+
+	//This utils class has some nice default upload/download buffers
+	smart_refctd_ptr<nbl::video::IUtilities> m_utils;
+
+	//We are going to have three buffers: One for upload, one for download, and one for the shader to work on as in/out
+	smart_refctd_ptr<IGPUBuffer> m_deviceBuffer;
+	StreamingTransientDataBufferMT<>* m_uploadBuffer;
+	StreamingTransientDataBufferMT<>* m_downloadBuffer;
+
+	// A `nbl::video::DeviceMemoryAllocator` is an interface to implement anything that can dish out free memory range to bind to back a `nbl::video::IGPUBuffer` or a `nbl::video::IGPUImage`
+	// The Logical Device itself implements the interface and behaves as the most simple allocator, it will create a new `nbl::video::IDeviceMemoryAllocation` every single time.
+	// We will cover allocators and suballocation in a later example.
+	IDeviceMemoryAllocator::SAllocation m_deviceBufferAllocation = {};
+
+	// Buffer Device Addresses for shader access
+	uint64_t m_deviceBufferAddress;
+
+	// You can ask the `nbl::core::GeneralpurposeAddressAllocator` used internally by the Streaming Buffers give out offsets aligned to a certain multiple (not only Power of Two!)
+	uint32_t m_alignment;
+
+	// Only Timeline Semaphores are supported in Nabla, there's no fences or binary semaphores.
+	// Swapchains run on adaptors with empty submits that make them look like they work with Timeline Semaphores,
+	// which has important side-effects we'll cover in another example.
+	smart_refctd_ptr<ISemaphore> m_timeline;
+	uint64_t m_iteration = 0;
+
 public:
-	// Generally speaking because certain platforms delay initialization from main object construction you should just forward and not do anything in the ctor
-	using base_t::base_t;
+
+	BubbleSortApp(const path& _localInputCWD, const path& _localOutputCWD, const path& _sharedInputCWD, const path& _sharedOutputCWD) :
+		system::IApplicationFramework(_localInputCWD, _localOutputCWD, _sharedInputCWD, _sharedOutputCWD) {}
 
 	// we stuff all our work here because its a "single shot" app
 	bool onAppInitialized(smart_refctd_ptr<ISystem>&& system) override
 	{
 		// Remember to call the base class initialization!
-		if (!base_t::onAppInitialized(std::move(system)))
+		if (!device_base_t::onAppInitialized(smart_refctd_ptr(system)))
 			return false;
-		// `system` could have been null (see the comments in `MonoSystemMonoLoggerApplication::onAppInitialized` as for why)
-		// use `MonoSystemMonoLoggerApplication::m_system` throughout the example instead!
+		if (!asset_base_t::onAppInitialized(std::move(system)))
+			return false;
 
-		// To do anything we need to create a Logical Device
-		smart_refctd_ptr<nbl::video::ILogicalDevice> device;
-
-		// Only Timeline Semaphores are supported in Nabla, there's no fences or binary semaphores.
-		// Swapchains run on adaptors with empty submits that make them look like they work with Timeline Semaphores,
-		// which has important side-effects we'll cover in another example.
-		constexpr auto FinishedValue = 45;
-		smart_refctd_ptr<ISemaphore> progress;
-
-		// A `nbl::video::DeviceMemoryAllocator` is an interface to implement anything that can dish out free memory range to bind to back a `nbl::video::IGPUBuffer` or a `nbl::video::IGPUImage`
-		// The Logical Device itself implements the interface and behaves as the most simple allocator, it will create a new `nbl::video::IDeviceMemoryAllocation` every single time.
-		// We will cover allocators and suballocation in a later example.
-		nbl::video::IDeviceMemoryAllocator::SAllocation allocation = {};
-
-		// For our Compute Shader
-		constexpr uint32_t WorkgroupSize = 256;
-		constexpr uint32_t WorkgroupCount = 2048;
-
-		// This scope is kinda silly but it demonstrated that in Nabla we refcount all Vulkan resources and keep the ones used in sumbits (semaphores and commandbuffers) alive till the submit is no longer pending
+		// this time we load a shader directly from a file
+		smart_refctd_ptr<IGPUShader> shader;
 		{
-			// You should already know Vulkan and come here to save on the boilerplate, if you don't know what instances and instance extensions are, then find out.
-			smart_refctd_ptr<nbl::video::CVulkanConnection> api;
-			{
-				// You generally want to default initialize any parameter structs
-				nbl::video::IAPIConnection::SFeatures apiFeaturesToEnable = {};
-				// generally you want to make your life easier during development
-				apiFeaturesToEnable.validations = true;
-				apiFeaturesToEnable.synchronizationValidation = true;
-				// want to make sure we have this so we can name resources for vieweing in RenderDoc captures
-				apiFeaturesToEnable.debugUtils = true;
-				// create our Vulkan instance
-				if (!(api = CVulkanConnection::create(smart_refctd_ptr(m_system), 0, _NBL_APP_NAME_, smart_refctd_ptr(base_t::m_logger), apiFeaturesToEnable)))
-					return logFail("Failed to crate an IAPIConnection!");
-			}
+			IAssetLoader::SAssetLoadParams lp = {};
+			lp.logger = m_logger.get();
+			lp.workingDirectory = ""; // virtual root
+			auto assetBundle = m_assetMgr->getAsset("app_resources/shader.comp.hlsl", lp);
+			const auto assets = assetBundle.getContents();
+			if (assets.empty())
+				return logFail("Could not load shader!");
 
-			// We won't go deep into performing physical device selection in this example, we'll take any device with a compute queue.
-			uint8_t queueFamily;
-			// Nabla has its own set of required baseline Vulkan features anyway, it won't report any device that doesn't meet them.
-			nbl::video::IPhysicalDevice* physDev = nullptr;
-			ILogicalDevice::SCreationParams params = {};
-			for (auto physDevIt = api->getPhysicalDevices().begin(); physDevIt != api->getPhysicalDevices().end(); physDevIt++)
-			{
-				const auto familyProps = (*physDevIt)->getQueueFamilyProperties();
-				// this is the only "complicated" part, we want to create a queue that supports compute pipelines
-				for (auto i = 0; i < familyProps.size(); i++)
-					if (familyProps[i].queueFlags.hasFlags(IQueue::FAMILY_FLAGS::COMPUTE_BIT))
-					{
-						physDev = *physDevIt;
-						queueFamily = i;
-						params.queueParams[queueFamily].count = 1;
-						break;
-					}
-			}
-			if (!physDev)
-				return logFail("Failed to find any Physical Devices with Compute capable Queue Families!");
+			// lets go straight from ICPUSpecializedShader to IGPUSpecializedShader
+			auto source = IAsset::castDown<ICPUShader>(assets[0]);
+			// The down-cast should not fail!
+			assert(source);
 
-			// logical devices need to be created form physical devices which will actually let us create vulkan objects and use the physical device
-			device = physDev->createLogicalDevice(std::move(params));
-			if (!device)
-				return logFail("Failed to create a Logical Device!");
+			// this time we skip the use of the asset converter since the ICPUShader->IGPUShader path is quick and simple
+			shader = m_device->createShader(source.get());
+			if (!shader)
+				return logFail("Creation of a GPU Shader to from CPU Shader source failed!");
+		}
 
-			// A word about `nbl::asset::IAsset`s, whenever you see an `nbl::asset::ICPUSomething` you can be sure an `nbl::video::IGPUSomething exists, and they both inherit from `nbl::asset::ISomething`.
-			// The convention is that an `ICPU` object represents a potentially Mutable (and in the past, Serializable) recipe for creating an `IGPU` object, and later examples will show automated systems for doing that.
-			// The Assets always form a Directed Acyclic Graph and our type system enforces that property at compile time (i.e. an `IBuffer` cannot reference an `IImageView` even indirectly).
-			// Another reason for the 1:1 pairing of types is that one can use a CPU-to-GPU associative cache (asset manager has a default one) and use the pointers to the CPU objects as UUIDs.
-			// The ICPUShader is just a mutable container for source code (can be high level like HLSL needing compilation to SPIR-V or SPIR-V itself) held in an `nbl::asset::ICPUBuffer`.
-			// They can be created: from buffers of code, by compilation from some other source code, or loaded from files (next example will do that).
-			smart_refctd_ptr<nbl::asset::ICPUShader> evenPassCPUShader;
-			smart_refctd_ptr<nbl::asset::ICPUShader> oddPassCPUShader;
-			{
-				// Normally we'd use the ISystem and the IAssetManager to load shaders flexibly from (virtual) files for ease of development (syntax highlighting and Intellisense),
-				// but I want to show the full process of assembling a shader from raw source code at least once.
-				smart_refctd_ptr<nbl::asset::IShaderCompiler> compiler = make_smart_refctd_ptr<nbl::asset::CHLSLCompiler>(smart_refctd_ptr(m_system));
+		const nbl::asset::SPushConstantRange pcRange = { .stageFlags = IShader::ESS_COMPUTE,.offset = 0,.size = sizeof(PushConstantData) };
 
-				// A simple shader that writes out the Global Invocation Index to the position it corresponds to in the buffer
-				// Note the injection of a define from C++ to keep the workgroup size in sync.
-				// P.S. We don't have an entry point name compiler option because we expect that future compilers should support multiple entry points, so for now there must be a single entry point called "main".
-				constexpr const char* evenPass = R"===(
-						#pragma wave shader_stage(compute)
+		// Nabla actually has facilities for SPIR-V Reflection and "guessing" pipeline layouts for a given SPIR-V which we'll cover in a different example
+		smart_refctd_ptr<nbl::video::IGPUPipelineLayout> pplnLayout = m_device->createPipelineLayout({ &pcRange, 1 });
+		if (!pplnLayout)
+			return logFail("Failed to create a Pipeline Layout!\n");
+		{
+			IGPUComputePipeline::SCreationParams params = {};
+			params.layout = pplnLayout.get();
+			// Theoretically a blob of SPIR-V can contain multiple named entry points and one has to be chosen, in practice most compilers only support outputting one (and glslang used to require it be called "main")
+			params.shader.entryPoint = "main";
+			params.shader.shader = shader.get();
+			// we'll cover the specialization constant API in another example
+			if (!m_device->createComputePipelines(nullptr, { &params,1 }, &m_pipeline))
+				return logFail("Failed to create pipelines (compile & link shaders)!\n");
+		}
 
-						struct PushConstantData
-						{
-							uint32_t dataElementCount;
-						};
 
-						[[vk::push_constant]] PushConstantData pushConstants;
+		// Determine sizes of buffers created with the IUtilities class
+		constexpr uint32_t BufferSize = sizeof(uint32_t) * elementCount;
+		constexpr uint32_t DownloadBufferSize = BufferSize;
+		constexpr uint32_t UploadBufferSize = BufferSize;
 
-						[[vk::binding(0,0)]] RWStructuredBuffer<uint32_t> buff;
+		// WARNING! Leaving upload/download buffer sizes by default to avoid having to check for a minimum size
+		// If you try to modify this demo for too big a buffer you might need to add these back
+		m_utils = make_smart_refctd_ptr<IUtilities>(smart_refctd_ptr(m_device), smart_refctd_ptr(m_logger));
+		if (!m_utils)
+			return logFail("Failed to create Utilities!");
+		m_uploadBuffer = m_utils->getDefaultUpStreamingBuffer();
+		m_downloadBuffer = m_utils->getDefaultDownStreamingBuffer();
 
-						[numthreads(WORKGROUP_SIZE,1,1)]
-						void main(uint32_t3 ID : SV_DispatchThreadID)
-						{
-							uint32_t N = 2 * ID.x;
-							if (N + 1 >= pushConstants.dataElementCount)
-								return;
+		const auto& deviceLimits = m_device->getPhysicalDevice()->getLimits();
+		// The ranges of non-coherent mapped memory you flush or invalidate need to be aligned. You'll often see a value of 64 reported by devices
+		// which just happens to coincide with a CPU cache line size. So we ask our streaming buffers during allocation to give us properly aligned offsets.
+		// Sidenote: For SSBOs, UBOs, BufferViews, Vertex Buffer Bindings, Acceleration Structure BDAs, Shader Binding Tables, Descriptor Buffers, etc.
+		// there is also a requirement to bind buffers at offsets which have a certain alignment. Memory binding to Buffers and Images also has those.
+		// We'll align to max of coherent atom size even if the memory is coherent,
+		// and we also need to take into account BDA shader loads need to be aligned to the type being loaded.
+		m_alignment = core::max(deviceLimits.nonCoherentAtomSize, alignof(float));
 
-							uint32_t aux = 0;
+		// In contrast to fences, we just need one semaphore to rule all dispatches
+		m_timeline = m_device->createSemaphore(m_iteration);
 
-							if (buff[N] > buff[N+1]) {
-								aux = buff[N];
-								buff[N] = buff[N+1];
-								buff[N+1] = aux;
-							}
-						}
-					)===";
+		// Get compute queue
+		IQueue* const queue = getComputeQueue();
 
-				constexpr const char* oddPass = R"===(
-						#pragma wave shader_stage(compute)
+		// The allocators can do multiple allocations at once for efficiency
+		const uint32_t AllocationCount = 1;
 
-						struct PushConstantData
-						{
-							uint32_t dataElementCount;
-						};
+		// It comes with a certain drawback that you need to remember to initialize your "yet unallocated" offsets to the Invalid value
+		// this is to allow a set of allocations to fail, and you to re-try after doing something to free up space without repacking args.
+		auto inputOffset = m_uploadBuffer->invalid_value;
 
-						[[vk::push_constant]] PushConstantData pushConstants;
+		// We always just wait till an allocation becomes possible (during allocation previous "latched" frees get their latch conditions polled)
+		// Freeing of Streaming Buffer Allocations can and should be deferred until an associated polled event signals done (more on that later).
+		std::chrono::steady_clock::time_point waitTill(std::chrono::years(45));
+		// note that the API takes a time-point not a duration, because there are multiple waits and preemptions possible, so the durations wouldn't add up properly
+		m_uploadBuffer->multi_allocate(waitTill, AllocationCount, &inputOffset, &UploadBufferSize, &m_alignment);
 
-						[[vk::binding(0,0)]] RWStructuredBuffer<uint32_t> buff;
-
-						[numthreads(WORKGROUP_SIZE,1,1)]
-						void main(uint32_t3 ID : SV_DispatchThreadID)
-						{
-							uint32_t N = 2 * ID.x;
-							if (N + 2 >= pushConstants.dataElementCount)
-								return;
-
-							uint32_t aux = 0;
-
-							if (buff[N+1] > buff[N+2]) {
-								aux = buff[N+1];
-								buff[N+1] = buff[N+2];
-								buff[N+2] = aux;
-							}
-						}
-					)===";
-
-				// Yes we know workgroup sizes can come from specialization constants, however DXC has a problem with that https://github.com/microsoft/DirectXShaderCompiler/issues/3092
-				const string WorkgroupSizeAsStr = std::to_string(WorkgroupSize);
-				const IShaderCompiler::SPreprocessorOptions::SMacroDefinition WorkgroupSizeDefine = { "WORKGROUP_SIZE",WorkgroupSizeAsStr };
-
-				CHLSLCompiler::SOptions options = {};
-				// really we should set it to `ESS_COMPUTE` since we know, but we'll test the `#pragma` handling fur teh lulz
-				options.stage = asset::IShader::E_SHADER_STAGE::ESS_UNKNOWN;
-				// want as much debug as possible
-				options.debugInfoFlags |= IShaderCompiler::E_DEBUG_INFO_FLAGS::EDIF_LINE_BIT;
-				// this lets you source-level debug/step shaders in renderdoc
-				if (physDev->getLimits().shaderNonSemanticInfo)
-					options.debugInfoFlags |= IShaderCompiler::E_DEBUG_INFO_FLAGS::EDIF_NON_SEMANTIC_BIT;
-				// if you don't set the logger and source identifier you'll have no meaningful errors
-				options.preprocessorOptions.sourceIdentifier = "embedded.comp.hlsl";
-				options.preprocessorOptions.logger = m_logger.get();
-				options.preprocessorOptions.extraDefines = { &WorkgroupSizeDefine,&WorkgroupSizeDefine + 1 };
-				if (!(evenPassCPUShader = compiler->compileToSPIRV(evenPass, options)))
-					return logFail("Failed to compile following HLSL Shader:\n%s\n", evenPass);
-				if (!(oddPassCPUShader = compiler->compileToSPIRV(oddPass, options)))
-					return logFail("Failed to compile following HLSL Shader:\n%s\n", oddPass);
-			}
-
-			// Note how each ILogicalDevice method takes a smart-pointer r-value, so that the GPU objects refcount their dependencies
-			smart_refctd_ptr<nbl::video::IGPUShader> evenPassShader = device->createShader(evenPassCPUShader.get());
-			if (!evenPassShader)
-				return logFail("Failed to create a GPU Shader, seems the Driver doesn't like the SPIR-V we're feeding it!\n");
-
-			smart_refctd_ptr<nbl::video::IGPUShader> oddPassShader = device->createShader(oddPassCPUShader.get());
-			if (!oddPassShader)
-				return logFail("Failed to create a GPU Shader, seems the Driver doesn't like the SPIR-V we're feeding it!\n");
-
-			// the simplest example would have used push constants and BDA, but RenderDoc's debugging of that sucks, so I'll demonstrate "classical" binding of buffers with descriptors
-			nbl::video::IGPUDescriptorSetLayout::SBinding bindings[1] = {
-				{
-					.binding = 0,
-					.type = nbl::asset::IDescriptor::E_TYPE::ET_STORAGE_BUFFER,
-					.createFlags = IGPUDescriptorSetLayout::SBinding::E_CREATE_FLAGS::ECF_NONE, // not is not the time for descriptor indexing
-					.stageFlags = IGPUShader::ESS_COMPUTE,
-					.count = 1,
-					.samplers = nullptr // irrelevant for a buffer
-				}
-			};
-			smart_refctd_ptr<IGPUDescriptorSetLayout> dsLayout = device->createDescriptorSetLayout(bindings);
-			if (!dsLayout)
-				return logFail("Failed to create a Descriptor Layout!\n");
-
-			const nbl::asset::SPushConstantRange pcRange = { .stageFlags = IShader::ESS_COMPUTE,.offset = 0,.size = sizeof(PushConstantData) };
-
-			// Nabla actually has facilities for SPIR-V Reflection and "guessing" pipeline layouts for a given SPIR-V which we'll cover in a different example
-			smart_refctd_ptr<nbl::video::IGPUPipelineLayout> pplnLayout = device->createPipelineLayout({ &pcRange, 1 }, smart_refctd_ptr(dsLayout));
-			if (!pplnLayout)
-				return logFail("Failed to create a Pipeline Layout!\n");
-
-			// We use strong typing on the pipelines (Compute, Graphics, Mesh, RT), since there's no reason to polymorphically switch between different pipelines
-			smart_refctd_ptr<nbl::video::IGPUComputePipeline> evenPipeline;
-			smart_refctd_ptr<nbl::video::IGPUComputePipeline> oddPipeline;
-			{
-				IGPUComputePipeline::SCreationParams params = {};
-				params.layout = pplnLayout.get();
-				// Theoretically a blob of SPIR-V can contain multiple named entry points and one has to be chosen, in practice most compilers only support outputting one (and glslang used to require it be called "main")
-				params.shader.entryPoint = "main";
-				params.shader.shader = evenPassShader.get();
-				// we'll cover the specialization constant API in another example
-				if (!device->createComputePipelines(nullptr, { &params,1 }, &evenPipeline))
-					return logFail("Failed to create pipelines (compile & link shaders)!\n");
-				params.shader.shader = oddPassShader.get();
-				// we'll cover the specialization constant API in another example
-				if (!device->createComputePipelines(nullptr, { &params,1 }, &oddPipeline))
-					return logFail("Failed to create pipelines (compile & link shaders)!\n");
-			}
-
-			// Our Descriptor Sets track (refcount) resources written into them, so you can pretty much drop and forget whatever you write into them.
-			// A later Descriptor Indexing example will test that this tracking is also correct for Update-After-Bind Descriptor Set bindings too.
-			smart_refctd_ptr<nbl::video::IGPUDescriptorSet> ds;
-
-			// Allocate the memory
-			{
-				constexpr size_t BufferSize = sizeof(uint32_t) * elementCount;
-
-				// Always default the creation parameters, there's a lot of extra stuff for DirectX/CUDA interop and slotting into external engines you don't usually care about. 
-				nbl::video::IGPUBuffer::SCreationParams params = {};
-				params.size = BufferSize;
-				// While the usages on `ICPUBuffers` are mere hints to our automated CPU-to-GPU conversion systems which need to be patched up anyway,
-				// the usages on an `IGPUBuffer` are crucial to specify correctly.
-				params.usage = IGPUBuffer::EUF_STORAGE_BUFFER_BIT;
-				smart_refctd_ptr<IGPUBuffer> inoutBuff = device->createBuffer(std::move(params));
-				if (!inoutBuff)
-					return logFail("Failed to create a GPU Buffer of size %d!\n", params.size);
-
-				// Naming objects is cool because not only errors (such as Vulkan Validation Layers) will show their names, but RenderDoc captures too.
-				inoutBuff->setObjectDebugName("My Output Buffer");
-
-				// We don't want to bother explaining best staging buffer practices just yet, so we will create a buffer over
-				// a memory type thats Host Visible (can be mapped and give the CPU a direct pointer to read from)
-				nbl::video::IDeviceMemoryBacked::SDeviceMemoryRequirements reqs = inoutBuff->getMemoryReqs();
-				// you can simply constrain the memory requirements by AND-ing the type bits of the host visible memory types
-				reqs.memoryTypeBits &= physDev->getHostVisibleMemoryTypeBits();
-
-				// There are actually two `allocate` overloads, one which allocates memory if you already know the type you want.
-				// And this one which is a utility which tries to allocate from every type that matches your requirements in some order of preference.
-				// The other of preference (iteration over compatible types) can be controlled by the method's template parameter,
-				// the default is from lowest index to highest, but skipping over incompatible types.
-				allocation = device->allocate(reqs, inoutBuff.get(), nbl::video::IDeviceMemoryAllocation::EMAF_NONE);
-				if (!allocation.isValid())
-					return logFail("Failed to allocate Device Memory compatible with our GPU Buffer!\n");
-
-				// Note that we performed a Dedicated Allocation above, so there's no need to bind the memory anymore (since the allocator knows the dedication, it can already bind).
-				// This is a carryover from having an OpenGL backend, where you couldn't have a memory allocation separate from the resource, so all allocations had to be "dedicated".
-				// In Vulkan dedicated allocations are the most performant and still make sense as long as you won't blow the 4096 allocation limit on windows.
-				// You should always use dedicated allocations for images used for swapchains, framebuffer attachments (esp transient), as well as objects used in CUDA/DirectX interop.
-				assert(inoutBuff->getBoundMemory().memory == allocation.memory.get());
-
-				// This is a cool utility you can use instead of counting up how much of each descriptor type you need to N_i allocate descriptor sets with layout L_i from a single pool
-				smart_refctd_ptr<nbl::video::IDescriptorPool> pool = device->createDescriptorPoolForDSLayouts(IDescriptorPool::ECF_NONE, { &dsLayout.get(),1 });
-
-				// note how the pool will go out of scope but thanks for backreferences in each object to its parent/dependency it will be kept alive for as long as all the Sets it allocated
-				ds = pool->createDescriptorSet(std::move(dsLayout));
-				// we still use Vulkan 1.0 descriptor update style, could move to Update Templates but Descriptor Buffer ubiquity seems just around the corner
-				{
-					IGPUDescriptorSet::SDescriptorInfo info[1];
-					info[0].desc = smart_refctd_ptr(inoutBuff); // bad API, too late to change, should just take raw-pointers since not consumed
-					info[0].info.buffer = { .offset = 0,.size = BufferSize };
-					IGPUDescriptorSet::SWriteDescriptorSet writes[1] = {
-						{.dstSet = ds.get(),.binding = 0,.arrayElement = 0,.count = 1,.info = info}
-					};
-					device->updateDescriptorSets(writes, {});
-				}
-			}
-
-			// To be able to read the contents of the buffer we need to map its memory
-			// P.S. Nabla mandates Persistent Memory Mappings on all backends (but not coherent memory types)
-			auto mapped_memory = allocation.memory->map({ 0ull,allocation.memory->getAllocationSize() }, IDeviceMemoryAllocation::EMCAF_READ);
-			if (!mapped_memory)
-				return logFail("Failed to map the Device Memory!\n");
-
+		{
+			// Create a buffer with unique elements in [0, elementCount)
 			uint32_t bufferData[elementCount];
 			for (uint32_t i = 0; i < elementCount; i++) {
 				bufferData[i] = i;
@@ -311,130 +157,265 @@ public:
 			std::mt19937 g(rd());
 			std::shuffle(std::begin(bufferData), std::end(bufferData), g);
 
-			memcpy(mapped_memory, bufferData, sizeof(uint32_t) * elementCount);
+			// Get pointer to buffer start for CPU access
+			auto* const inputPtr = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(m_uploadBuffer->getBufferPointer()) + inputOffset);
 
-			PushConstantData pc = PushConstantData{ elementCount };
+			// Upload buffer data to GPU
+			memcpy(inputPtr, bufferData, sizeof(uint32_t) * elementCount);
 
-			// Our commandbuffers are cool because they refcount the resources used by each command you record into them, so you can rely a commandbuffer on keeping them alive.
-			smart_refctd_ptr<nbl::video::IGPUCommandBuffer> evenCmdbuf;
-			smart_refctd_ptr<nbl::video::IGPUCommandBuffer> oddCmdbuf;
+			// Always remember to flush!
+			if (m_uploadBuffer->needsManualFlushOrInvalidate())
 			{
-				smart_refctd_ptr<nbl::video::IGPUCommandPool> cmdpool = device->createCommandPool(queueFamily, IGPUCommandPool::CREATE_FLAGS::RESET_COMMAND_BUFFER_BIT);
-				if (!cmdpool->createCommandBuffers(IGPUCommandPool::BUFFER_LEVEL::PRIMARY, 1u, &evenCmdbuf))
-					return logFail("Failed to create Command Buffers!\n");
-				if (!cmdpool->createCommandBuffers(IGPUCommandPool::BUFFER_LEVEL::PRIMARY, 1u, &oddCmdbuf))
-					return logFail("Failed to create Command Buffers!\n");
-			}
-
-			// Create the Semaphore
-			constexpr uint64_t StartedValue = 0;
-			uint64_t timeline = StartedValue;
-			//static_assert(StartedValue < FinishedValue);
-			progress = device->createSemaphore(StartedValue);
-
-			for (auto i = 0u; i < elementCount; i++) {
-				if (i % 100 == 0) {
-					m_logger->log("On iteration %d", ILogger::ELL_PERFORMANCE, i);
-				}
-				evenCmdbuf->begin(IGPUCommandBuffer::USAGE::NONE);
-				// If you enable the `debugUtils` API Connection feature on a supported backend as we've done, you'll get these pretty debug sections in RenderDoc
-				evenCmdbuf->beginDebugMarker("My Compute Dispatch", core::vectorSIMDf(0, 1, 0, 1));
-				// you want to bind the pipeline first to avoid accidental unbind of descriptor sets due to compatibility matching
-				evenCmdbuf->bindComputePipeline(evenPipeline.get());
-				evenCmdbuf->bindDescriptorSets(nbl::asset::EPBP_COMPUTE, pplnLayout.get(), 0, 1, &ds.get());
-				evenCmdbuf->pushConstants(pplnLayout.get(), IShader::ESS_COMPUTE, 0u, sizeof(pc), &pc);
-				evenCmdbuf->dispatch(ceil((float)elementCount / (WorkgroupSize * 2)), 1, 1);
-				evenCmdbuf->endDebugMarker();
-				// Normally you'd want to perform a memory barrier when using the output of a compute shader or renderpass,
-				// however signalling a timeline semaphore with the COMPUTE stage mask and waiting for it on the Host makes all Device writes visible.
-				evenCmdbuf->end();
-
-				oddCmdbuf->begin(IGPUCommandBuffer::USAGE::NONE);
-				// If you enable the `debugUtils` API Connection feature on a supported backend as we've done, you'll get these pretty debug sections in RenderDoc
-				oddCmdbuf->beginDebugMarker("My Compute Dispatch", core::vectorSIMDf(0, 1, 0, 1));
-				// you want to bind the pipeline first to avoid accidental unbind of descriptor sets due to compatibility matching
-				oddCmdbuf->bindComputePipeline(oddPipeline.get());
-				oddCmdbuf->bindDescriptorSets(nbl::asset::EPBP_COMPUTE, pplnLayout.get(), 0, 1, &ds.get());
-				oddCmdbuf->pushConstants(pplnLayout.get(), IShader::ESS_COMPUTE, 0u, sizeof(pc), &pc);
-				oddCmdbuf->dispatch(ceil((float)elementCount / (WorkgroupSize * 2)), 1, 1);
-				oddCmdbuf->endDebugMarker();
-				// Normally you'd want to perform a memory barrier when using the output of a compute shader or renderpass,
-				// however signalling a timeline semaphore with the COMPUTE stage mask and waiting for it on the Host makes all Device writes visible.
-				oddCmdbuf->end();
-
-
-				{
-					// queues are inherent parts of the device, ergo not refcounted (you refcount the device instead)
-					IQueue* queue = device->getQueue(queueFamily, 0);
-
-					// Default, we have no semaphores to wait on before we can start our workload
-					IQueue::SSubmitInfo submitInfos[2] = {};
-					// The IGPUCommandBuffer is the only object whose usage does not get automagically tracked internally, you're responsible for holding onto it as long as the GPU needs it.
-					// So this is why our commandbuffer, even though its transient lives in the scope equal or above the place where we wait for the submission to be signalled as complete.
-					const IQueue::SSubmitInfo::SCommandBufferInfo evenCmdbufs[] = { {.cmdbuf = evenCmdbuf.get()} };
-					const IQueue::SSubmitInfo::SCommandBufferInfo oddCmdbufs[] = { {.cmdbuf = oddCmdbuf.get()} };
-					submitInfos[0].commandBuffers = evenCmdbufs;
-					submitInfos[1].commandBuffers = oddCmdbufs;
-					//wait infos
-					const IQueue::SSubmitInfo::SSemaphoreInfo evenWaits[] = { {.semaphore = progress.get(),.value = timeline, .stageMask = asset::PIPELINE_STAGE_FLAGS::COMPUTE_SHADER_BIT} };
-					const IQueue::SSubmitInfo::SSemaphoreInfo oddWaits[] = { {.semaphore = progress.get(),.value = timeline + 1, .stageMask = asset::PIPELINE_STAGE_FLAGS::COMPUTE_SHADER_BIT} };
-					submitInfos[0].waitSemaphores = evenWaits;
-					submitInfos[1].waitSemaphores = oddWaits;
-					// But we do need to signal completion by incrementing the Timeline Semaphore counter as soon as the compute shader is done
-					const IQueue::SSubmitInfo::SSemaphoreInfo evenSignals[] = { {.semaphore = progress.get(),.value = timeline + 1,.stageMask = asset::PIPELINE_STAGE_FLAGS::COMPUTE_SHADER_BIT} };
-					const IQueue::SSubmitInfo::SSemaphoreInfo oddSignals[] = { {.semaphore = progress.get(),.value = timeline + 2,.stageMask = asset::PIPELINE_STAGE_FLAGS::COMPUTE_SHADER_BIT} };
-					submitInfos[0].signalSemaphores = evenSignals;
-					submitInfos[1].signalSemaphores = oddSignals;
-
-					// We have a cool integration with RenderDoc that allows you to start and end captures programmatically.
-					// This is super useful for debugging multi-queue workloads and by default RenderDoc delimits captures only by Swapchain presents.
-					queue->startCapture();
-					queue->submit(submitInfos);
-					queue->endCapture();
-
-					timeline += 2;
-				}
-
-				// As the name implies this function will not progress until the fence signals or repeated waiting returns an error.
-				const ISemaphore::SWaitInfo waitInfos[] = { {
-					.semaphore = progress.get(),
-					.value = timeline
-				} };
-				device->blockForSemaphores(waitInfos);
+				const auto bound = m_uploadBuffer->getBuffer()->getBoundMemory();
+				const ILogicalDevice::MappedMemoryRange range(bound.memory, bound.offset + inputOffset, BufferSize);
+				m_device->flushMappedMemoryRanges(1, &range);
 			}
 		}
 
+		// Allocate download buffer for CPU readback
+		auto outputOffset = m_downloadBuffer->invalid_value;
+		m_downloadBuffer->multi_allocate(waitTill, AllocationCount, &outputOffset, &DownloadBufferSize, &m_alignment);
 
+		// Create the buffer the Compute Shader will use for the sort
+		{
+			// Always default the creation parameters, there's a lot of extra stuff for DirectX/CUDA interop and slotting into external engines you don't usually care about. 
+			nbl::video::IGPUBuffer::SCreationParams params = {};
+			params.size = BufferSize;
+			// While the usages on `ICPUBuffers` are mere hints to our automated CPU-to-GPU conversion systems which need to be patched up anyway,
+			// the usages on an `IGPUBuffer` are crucial to specify correctly.
+			params.usage = IGPUBuffer::EUF_STORAGE_BUFFER_BIT | IGPUBuffer::EUF_TRANSFER_SRC_BIT | IGPUBuffer::EUF_TRANSFER_DST_BIT;
+			m_deviceBuffer = m_device->createBuffer(std::move(params));
+			if (!m_deviceBuffer)
+				return logFail("Failed to create a GPU Buffer of size %d!\n", params.size);
 
-		// if the mapping is not coherent the range needs to be invalidated to pull in new data for the CPU's caches
-		const ILogicalDevice::MappedMemoryRange memoryRange(allocation.memory.get(), 0ull, allocation.memory->getAllocationSize());
-		if (!allocation.memory->getMemoryPropertyFlags().hasFlags(IDeviceMemoryAllocation::EMPF_HOST_COHERENT_BIT))
-			device->invalidateMappedMemoryRanges(1, &memoryRange);
+			// Naming objects is cool because not only errors (such as Vulkan Validation Layers) will show their names, but RenderDoc captures too.
+			m_deviceBuffer->setObjectDebugName("My Device Buffer");
 
-		// a simple test to check we got the right thing back
-		auto buffData = reinterpret_cast<const uint32_t*>(allocation.memory->getMappedPointer());
-		assert(allocation.offset == 0); // simpler than writing out all the pointer arithmetic
-		std::string outBuffer;
-		for (auto i = 0; i < elementCount / 20; i++) {
-			for (auto j = 0; j < 20; j++) {
-				auto index = 20 * i + j;
-				if (index >= elementCount) continue;
-				//m_logger->log("%d", ILogger::ELL_PERFORMANCE, buffData[index]);
-				outBuffer.append(std::to_string(buffData[index]));
-				outBuffer.append(" ");
-			}
-			outBuffer.append("\n");
+			m_deviceBufferAddress = m_deviceBuffer->getDeviceAddress();
+
+			// Get memory requirements for buffer memory creation
+			nbl::video::IDeviceMemoryBacked::SDeviceMemoryRequirements reqs = m_deviceBuffer->getMemoryReqs();
+
+			// There are actually two `allocate` overloads, one which allocates memory if you already know the type you want.
+			// And this one which is a utility which tries to allocate from every type that matches your requirements in some order of preference.
+			// The other of preference (iteration over compatible types) can be controlled by the method's template parameter,
+			// the default is from lowest index to highest, but skipping over incompatible types.
+			m_deviceBufferAllocation = m_device->allocate(reqs, m_deviceBuffer.get(), nbl::video::IDeviceMemoryAllocation::EMAF_DEVICE_ADDRESS_BIT);
+			if (!m_deviceBufferAllocation.isValid())
+				return logFail("Failed to allocate Device Memory compatible with our GPU Buffer!\n");
+
+			// Note that we performed a Dedicated Allocation above, so there's no need to bind the memory anymore (since the allocator knows the dedication, it can already bind).
+			// This is a carryover from having an OpenGL backend, where you couldn't have a memory allocation separate from the resource, so all allocations had to be "dedicated".
+			// In Vulkan dedicated allocations are the most performant and still make sense as long as you won't blow the 4096 allocation limit on windows.
+			// You should always use dedicated allocations for images used for swapchains, framebuffer attachments (esp transient), as well as objects used in CUDA/DirectX interop.
+			assert(m_deviceBuffer->getBoundMemory().memory == m_deviceBufferAllocation.memory.get());
 		}
-		m_logger->log("Your ordered array is: \n" + outBuffer, ILogger::ELL_PERFORMANCE);
-		// This allocation would unmap itself in the dtor anyway, but lets showcase the API usage
-		allocation.memory->unmap();
+
+		PushConstantData pcEven = PushConstantData{ m_deviceBufferAddress, elementCount, 0 };
+		PushConstantData pcOdd = PushConstantData{ m_deviceBufferAddress, elementCount, 0 };
+
+		// Create a one time submit command buffer to copy data from upload to the device buffer
+		smart_refctd_ptr<nbl::video::IGPUCommandBuffer> copyCmdBuf;
+		// Similarly create a one time submit command buffer to copy data from device to download buffer
+		smart_refctd_ptr<nbl::video::IGPUCommandBuffer> copyBackCmdBuf;
+		
+		{
+			smart_refctd_ptr<nbl::video::IGPUCommandPool> cmdpool = m_device->createCommandPool(queue->getFamilyIndex(), IGPUCommandPool::CREATE_FLAGS::TRANSIENT_BIT);
+			if (!cmdpool->createCommandBuffers(IGPUCommandPool::BUFFER_LEVEL::PRIMARY, 1u, &copyCmdBuf))
+				return logFail("Failed to create Command Buffers!\n");
+			if (!cmdpool->createCommandBuffers(IGPUCommandPool::BUFFER_LEVEL::PRIMARY, 1u, &copyBackCmdBuf))
+				return logFail("Failed to create Command Buffers!\n");
+		}
+
+		// Copy data from upload to device buffer
+		copyCmdBuf->begin(IGPUCommandBuffer::USAGE::ONE_TIME_SUBMIT_BIT);
+		IGPUCommandBuffer::SBufferCopy copyInfo = {};
+		copyInfo.size = BufferSize;
+		copyInfo.srcOffset = inputOffset;
+		copyCmdBuf->copyBuffer(m_uploadBuffer->getBuffer(), m_deviceBuffer.get(), 1, &copyInfo);
+		copyCmdBuf->end();
+
+		const IQueue::SSubmitInfo::SCommandBufferInfo copyCmdBufInfo =
+		{
+			.cmdbuf = copyCmdBuf.get()
+		};
+
+		const IQueue::SSubmitInfo::SSemaphoreInfo copySignalInfo =
+		{
+			.semaphore = m_timeline.get(),
+			.value = m_iteration + 1,
+			.stageMask = asset::PIPELINE_STAGE_FLAGS::COMPUTE_SHADER_BIT
+		};
+
+		const IQueue::SSubmitInfo copySubmitInfo = {
+					.waitSemaphores = {},
+					.commandBuffers = {&copyCmdBufInfo,1},
+					.signalSemaphores = {&copySignalInfo,1}
+		};
+
+		queue->startCapture();
+		queue->submit({ &copySubmitInfo, 1 });
+		queue->endCapture();
+
+		// Upload Buffer deallocation will be launched only after copy is done
+		const ISemaphore::SWaitInfo copyWait = { m_timeline.get(), m_iteration + 1};
+
+		// Deallocate upload buffer
+		m_uploadBuffer->multi_deallocate(AllocationCount, &inputOffset, &UploadBufferSize, copyWait);
+
+		//Advance timeline 
+		m_iteration++;
+
+		// Wait for copy to avoid setting up waits on the compute command buffer
+		m_device->waitIdle();
+
+		// Command Buffer where we submit all compute work
+		smart_refctd_ptr<nbl::video::IGPUCommandBuffer> cmdBuf;
+
+		{
+			smart_refctd_ptr<nbl::video::IGPUCommandPool> cmdpool = m_device->createCommandPool(queue->getFamilyIndex(), IGPUCommandPool::CREATE_FLAGS::NONE);
+			if (!cmdpool->createCommandBuffers(IGPUCommandPool::BUFFER_LEVEL::PRIMARY, 1u, &cmdBuf))
+				return logFail("Failed to create Command Buffers!\n");
+		}
+
+		// Record the Command Buffer
+		cmdBuf->begin(IGPUCommandBuffer::USAGE::NONE);
+		// If you enable the `debugUtils` API Connection feature on a supported backend as we've done, you'll get these pretty debug sections in RenderDoc
+		cmdBuf->beginDebugMarker("My Compute Dispatch", core::vectorSIMDf(0, 1, 0, 1));
+		cmdBuf->bindComputePipeline(m_pipeline.get());
+		// Even pass push constants
+		cmdBuf->pushConstants(m_pipeline->getLayout(), IShader::ESS_COMPUTE, 0u, sizeof(pcEven), &pcEven);
+		// Even pass dispatch
+		cmdBuf->dispatch(ceil((float)elementCount / (WorkgroupSize * 2)), 1, 1);
+
+		// We need to create a memory dependency between the even pass and the odd pass
+		auto dependencyFlags = core::bitflag<asset::E_DEPENDENCY_FLAGS>(E_DEPENDENCY_FLAGS::EDF_NONE);
+		IGPUCommandBuffer::SPipelineBarrierDependencyInfo dependencyInfo = {};
+		const SMemoryBarrier memBarriers[] = { {.srcStageMask = PIPELINE_STAGE_FLAGS::COMPUTE_SHADER_BIT, .srcAccessMask = ACCESS_FLAGS::SHADER_WRITE_BITS,
+												.dstStageMask = PIPELINE_STAGE_FLAGS::COMPUTE_SHADER_BIT, .dstAccessMask = ACCESS_FLAGS::SHADER_READ_BITS} };
+
+		dependencyInfo.memBarriers = memBarriers;
+		// Pipeline barrier for compute passes
+		cmdBuf->pipelineBarrier(dependencyFlags, dependencyInfo);
+
+		// Odd pass push constants
+		cmdBuf->pushConstants(m_pipeline->getLayout(), IShader::ESS_COMPUTE, 0u, sizeof(pcOdd), &pcOdd);
+		// Odd pass dispatch
+		cmdBuf->dispatch(ceil((float)elementCount / (WorkgroupSize * 2)), 1, 1);
+
+		cmdBuf->endDebugMarker();
+		// Normally you'd want to perform a memory barrier when using the output of a compute shader or renderpass,
+		// however signalling a timeline semaphore with the COMPUTE stage mask and waiting for it on the Host makes all Device writes visible.
+		cmdBuf->end();
+
+		m_logger->log("Semaphore is at: %d, timeline value is %d\n", ILogger::ELL_PERFORMANCE, m_timeline->getCounterValue(), m_iteration);
+
+		for (auto i = 0u; i < elementCount; i++) {
+			if (i % 100 == 0) {
+				m_logger->log("On iteration %d", ILogger::ELL_PERFORMANCE, i);
+			}
+
+			IQueue::SSubmitInfo computeSubmitInfo[1] = {};
+
+			const IQueue::SSubmitInfo::SCommandBufferInfo computeCmdBuf[] = { {.cmdbuf = cmdBuf.get()} };
+			computeSubmitInfo[0].commandBuffers = computeCmdBuf;
+
+			// We're going to signal the timeline semaphore and then have the device wait on it between full (even-odd) passes
+			const IQueue::SSubmitInfo::SSemaphoreInfo computeSignals[] = { {.semaphore = m_timeline.get(),.value = m_iteration + 1,.stageMask = asset::PIPELINE_STAGE_FLAGS::COMPUTE_SHADER_BIT} };
+			computeSubmitInfo[0].signalSemaphores = computeSignals;
+
+			queue->startCapture();
+			queue->submit(computeSubmitInfo);
+			m_logger->log("Semaphore is at: %d, timeline value is %d\n", ILogger::ELL_PERFORMANCE, m_timeline->getCounterValue(), m_iteration);
+			queue->endCapture();
+
+			// As the name implies this function will not progress until the fence signals or repeated waiting returns an error.
+			const ISemaphore::SWaitInfo waitInfos[] = { {
+				.semaphore = m_timeline.get(),
+				.value = m_iteration + 1
+			} };
+			m_device->blockForSemaphores(waitInfos);
+
+			// Update iteration 
+			m_iteration++;
+		}
+
+		// Copy data from device to download buffer
+		copyBackCmdBuf->begin(IGPUCommandBuffer::USAGE::ONE_TIME_SUBMIT_BIT);
+		IGPUCommandBuffer::SBufferCopy copyBackInfo = {};
+		copyBackInfo.size = BufferSize;
+		copyBackInfo.srcOffset = inputOffset;
+		copyBackCmdBuf->copyBuffer(m_uploadBuffer->getBuffer(), m_deviceBuffer.get(), 1, &copyBackInfo);
+		copyBackCmdBuf->end();
+
+		IQueue::SSubmitInfo copyBackSubmitInfo[1] = {};
+		const IQueue::SSubmitInfo::SCommandBufferInfo copyBackCmdBufInfo[] = { {.cmdbuf = copyBackCmdBuf.get()} };
+		copyBackSubmitInfo[0].commandBuffers = copyBackCmdBufInfo;
+
+		queue->startCapture();
+		queue->submit(copyBackSubmitInfo);
+		queue->endCapture();
+
+		// Wait for copy
+		m_device->waitIdle();
+
+		// Create a one time submit command buffer for CPU readback of data
+		smart_refctd_ptr<nbl::video::IGPUCommandBuffer> readbackCmdBuf;
+		{
+			smart_refctd_ptr<nbl::video::IGPUCommandPool> cmdpool = m_device->createCommandPool(queue->getFamilyIndex(), IGPUCommandPool::CREATE_FLAGS::TRANSIENT_BIT);
+			if (!cmdpool->createCommandBuffers(IGPUCommandPool::BUFFER_LEVEL::PRIMARY, 1u, &readbackCmdBuf))
+				return logFail("Failed to create Command Buffers!\n");
+		}
+		// We let the readback latch know that the sorting is done
+		const ISemaphore::SWaitInfo futureWait = { m_timeline.get(),m_iteration };
+
+		// Stolen from the 05 example
+		auto latchedConsumer = make_smart_refctd_ptr<IUtilities::CDownstreamingDataConsumer>(
+			IDeviceMemoryAllocation::MemoryRange(outputOffset, BufferSize),
+			// Note the use of capture by-value [=] and not by-reference [&] because this lambda will be called asynchronously whenever the event signals
+			[=](const size_t dstOffset, const void* bufSrc, const size_t size)->void
+			{
+				// The unused variable is used for letting the consumer know the subsection of the output we've managed to download
+				// But here we're sure we can get the whole thing in one go because we allocated the whole range ourselves.
+				assert(dstOffset == 0 && size == BufferSize);
+
+				// I can const cast, we know the mapping is just a pointer
+				uint32_t* const data = reinterpret_cast<uint32_t*>(const_cast<void*>(bufSrc));
+				std::string outBuffer;
+				for (auto i = 0; i < elementCount / 20; i++) {
+					for (auto j = 0; j < 20; j++) {
+						auto index = 20 * i + j;
+						if (index >= elementCount) continue;
+						outBuffer.append(std::to_string(data[index]));
+						outBuffer.append(" ");
+					}
+					outBuffer.append("\n");
+				}
+				m_logger->log("Your ordered array is: \n" + outBuffer, ILogger::ELL_PERFORMANCE);
+			},
+			// Its also necessary to hold onto the commandbuffer because if it
+			// hits its destructor, our automated reference counting will drop all references to objects used in the recorded commands.
+			// It could also be latched in the upstreaming deallocate, because its the same fence.
+			std::move(readbackCmdBuf), m_downloadBuffer
+		);
+
+		// We put a function we want to execute 
+		m_downloadBuffer->multi_deallocate(AllocationCount, &outputOffset, &DownloadBufferSize, futureWait, &latchedConsumer.get());
 
 		// There's just one caveat, the Queues tracking what resources get used in a submit do it via an event queue that needs to be polled to clear.
 		// The tracking causes circular references from the resource back to the device, so unless we poll at the end of the application, they resources used by last submit will leak.
 		// We could of-course make a very lazy thread that wakes up every second or so and runs this GC on the queues, but we think this is enough book-keeping for the users.
-		device->waitIdle();
+		//m_device->waitIdle();
 
 		return true;
+	}
+
+	bool onAppTerminated() override
+	{
+		// Need to make sure that there are no events outstanding if we want all lambdas to eventually execute before `onAppTerminated`
+		// (the destructors of the Streaming buffers will still wait for all lambda events to drain)
+		while (m_downloadBuffer->cull_frees()) {}
+		return device_base_t::onAppTerminated();
 	}
 
 	// Platforms like WASM expect the main entry point to periodically return control, hence if you want a crossplatform app, you have to let the framework deal with your "game loop"
@@ -446,4 +427,4 @@ public:
 };
 
 
-NBL_MAIN_FUNC(HelloComputeApp)
+NBL_MAIN_FUNC(BubbleSortApp)
